@@ -461,10 +461,12 @@ func TestBindCodexSIWCRejectsReplacedAccount(t *testing.T) {
 	if _, err := m.Update(context.Background(), replaced); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := m.GetByID(base.ID); got.RegistrationEpoch != base.RegistrationEpoch {
-		t.Fatalf("epoch changed: %d", got.RegistrationEpoch)
+	current, _ := m.GetByID(base.ID)
+	if current.RegistrationEpoch <= base.RegistrationEpoch {
+		t.Fatalf("replaced account kept predecessor epoch: %d", current.RegistrationEpoch)
 	}
-	if _, err := m.BindCodexSIWC(context.Background(), base.ID, base.RegistrationEpoch, "account", bindingTokens("bound")); err == nil {
+	// Use the current epoch so this still tests the independent account check.
+	if _, err := m.BindCodexSIWC(context.Background(), base.ID, current.RegistrationEpoch, "account", bindingTokens("bound")); err == nil {
 		t.Fatal("binding accepted a replaced account")
 	}
 	got, _ := m.GetByID(base.ID)

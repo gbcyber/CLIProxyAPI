@@ -51,7 +51,15 @@ type soonestResetFacts struct {
 	// weeklyReset is the reported weekly window reset; zero when unknown.
 	weeklyReset time.Time
 	// exhaustedUntil is when the latest used-up usage window ends; zero when none is used up.
-	exhaustedUntil time.Time
+	exhaustedUntil        time.Time
+	observedAt            time.Time
+	hasWeekly             bool
+	hasOther              bool
+	weeklyUsageUnknown    bool
+	otherUsageUnknown     bool
+	weeklyExhaustedUntil  time.Time
+	otherExhaustedUntil   time.Time
+	unifiedExhaustedUntil time.Time
 }
 
 // soonestResetRank orders credentials for the soonest-reset strategy.
@@ -71,38 +79,81 @@ func soonestResetFactsFor(auth *Auth) soonestResetFacts {
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	observedAt := auth.Quota.ObservedAt
 	weekly, hasWeekly, windows := quotaWindowsFor(provider, auth.Quota)
-	facts := soonestResetFacts{subscription: soonestResetSubscription(provider, auth)}
+	facts := soonestResetFacts{subscription: soonestResetSubscription(provider, auth), observedAt: observedAt, hasWeekly: hasWeekly, hasOther: len(windows) > 0}
 	if hasWeekly {
 		facts.weeklyReset = weekly.reset
-		windows = append(windows, weekly)
+		facts.weeklyUsageUnknown = weekly.usageUnknown
+		facts.weeklyExhaustedUntil = weekly.exhaustedUntil(observedAt)
 	}
 	for _, window := range windows {
-		if until := window.exhaustedUntil(observedAt); until.After(facts.exhaustedUntil) {
-			facts.exhaustedUntil = until
+		facts.otherUsageUnknown = facts.otherUsageUnknown || window.usageUnknown
+		if until := window.exhaustedUntil(observedAt); until.After(facts.otherExhaustedUntil) {
+			facts.otherExhaustedUntil = until
 		}
 	}
-	if len(windows) == 0 && provider == "claude" {
-		facts.exhaustedUntil = claudeUnifiedRejectionEnd(auth.Quota.Signals, observedAt)
+	if !hasWeekly && len(windows) == 0 && provider == "claude" {
+		until := claudeUnifiedRejectionEnd(auth.Quota.Signals, observedAt)
+		switch strings.ToLower(strings.TrimSpace(auth.Quota.Signals["Anthropic-Ratelimit-Unified-Representative-Claim"])) {
+		case "five_hour":
+			facts.hasOther = !until.IsZero()
+			facts.otherExhaustedUntil = until
+		case "seven_day":
+			facts.hasWeekly = !until.IsZero()
+			facts.weeklyExhaustedUntil = until
+		default:
+			facts.unifiedExhaustedUntil = until
+		}
 	}
-	facts.windowed = len(windows) > 0
+	facts.windowed = hasWeekly || len(windows) > 0
+	facts.exhaustedUntil = maxResetTime(facts.weeklyExhaustedUntil, facts.otherExhaustedUntil, facts.unifiedExhaustedUntil)
 	facts.learnable = facts.subscription &&
 		(observedAt.IsZero() || !facts.windowed || (hasWeekly && weekly.reset.IsZero()))
 	return facts
 }
 
-// carry returns f, or previous when f reports no usage window but previous does. Such a
-// snapshot says nothing about the windows: Claude's request-scoped fast-mode credit refusal,
-// for example, carries unified quota headers without any window, and must not make a
-// credential whose weekly reset is known rank as unknown. A rejection without windows still
-// keeps the credential used up until it ends.
+// carry retains exhaustion until its reset unless fresh usage reports recovery.
+// Reset metadata alone is not evidence of recovery.
 func (f soonestResetFacts) carry(previous soonestResetFacts) soonestResetFacts {
-	if f.windowed || !previous.windowed || f.subscription != previous.subscription {
+	if (!previous.windowed && !previous.hasWeekly && !previous.hasOther) || f.subscription != previous.subscription {
 		return f
 	}
-	if f.exhaustedUntil.After(previous.exhaustedUntil) {
-		previous.exhaustedUntil = f.exhaustedUntil
+	if f.weeklyReset.IsZero() && previous.weeklyReset.After(f.observedAt) {
+		f.weeklyReset = previous.weeklyReset
 	}
-	return previous
+	if (!f.hasWeekly || f.weeklyUsageUnknown) && previous.hasWeekly {
+		f.hasWeekly = true
+		if previous.weeklyExhaustedUntil.After(f.observedAt) {
+			f.weeklyExhaustedUntil = previous.weeklyExhaustedUntil
+		}
+		if !f.weeklyReset.After(f.observedAt) && f.subscription {
+			f.learnable = true
+		}
+	}
+	if (!f.hasOther || f.otherUsageUnknown) && previous.hasOther {
+		f.hasOther = true
+		if previous.otherExhaustedUntil.After(f.observedAt) {
+			f.otherExhaustedUntil = previous.otherExhaustedUntil
+		}
+	}
+	if !f.windowed {
+		f.unifiedExhaustedUntil = maxResetTime(f.unifiedExhaustedUntil, previous.unifiedExhaustedUntil)
+		if f.weeklyReset.After(f.observedAt) || !f.hasWeekly {
+			f.learnable = previous.learnable
+		}
+	}
+	f.windowed = true
+	f.exhaustedUntil = maxResetTime(f.weeklyExhaustedUntil, f.otherExhaustedUntil, f.unifiedExhaustedUntil)
+	return f
+}
+
+func maxResetTime(values ...time.Time) time.Time {
+	var latest time.Time
+	for _, value := range values {
+		if value.After(latest) {
+			latest = value
+		}
+	}
+	return latest
 }
 
 // rank ranks the facts at now. probePending reports a recent probe pick of the credential.
@@ -291,9 +342,10 @@ func soonestResetSubscription(provider string, auth *Auth) bool {
 
 // quotaWindow is one usage window read from quota signals; each part may be missing.
 type quotaWindow struct {
-	usedUp bool
-	reset  time.Time
-	length time.Duration
+	usedUp       bool
+	usageUnknown bool
+	reset        time.Time
+	length       time.Duration
 }
 
 // exhaustedUntil reports until when a used-up window holds: its reset, else its length (or
@@ -338,16 +390,17 @@ func quotaWindowsFor(provider string, quota QuotaState) (weekly quotaWindow, has
 func claudeQuotaWindows(signals map[string]string) (quotaWindow, bool, []quotaWindow) {
 	read := func(label string, length time.Duration) (quotaWindow, bool) {
 		prefix := "Anthropic-Ratelimit-Unified-" + label + "-"
-		status := strings.TrimSpace(signals[prefix+"Status"])
+		status := strings.ToLower(strings.TrimSpace(signals[prefix+"Status"]))
 		utilization, hasUtilization := quotaSignalNumber(signals, prefix+"Utilization")
 		reset, hasReset := parseQuotaResetTime(signals[prefix+"Reset"])
 		if status == "" && !hasUtilization && !hasReset {
 			return quotaWindow{}, false
 		}
 		return quotaWindow{
-			usedUp: strings.EqualFold(status, "rejected") || (hasUtilization && utilization >= 1),
-			reset:  reset,
-			length: length,
+			usedUp:       status == "rejected" || (hasUtilization && utilization >= 1),
+			usageUnknown: !(hasUtilization && utilization >= 0) && status != "rejected" && status != "allowed" && status != "allowed_warning",
+			reset:        reset,
+			length:       length,
 		}, true
 	}
 	weekly, hasWeekly := read("7d", quotaWindowWeek)

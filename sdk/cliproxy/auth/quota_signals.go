@@ -23,6 +23,20 @@ func ProviderSupportsQuotaObservation(provider string) bool {
 	}
 }
 
+// quotaObservationIdentityMatches excludes rotating tokens: a refresh does not
+// change the account that owns a passive quota observation.
+func quotaObservationIdentityMatches(a, b *Auth) bool {
+	if a == nil || b == nil || a.Provider != b.Provider {
+		return false
+	}
+	for _, key := range []string{"account_id", "account_uuid", "organization_uuid", "email", "sub", "user_id"} {
+		if authMetadataString(a, key) != authMetadataString(b, key) {
+			return false
+		}
+	}
+	return true
+}
+
 // ObserveResponseHeadersForProvider replaces the passive quota snapshot with the
 // signals carried by the current upstream response.
 //

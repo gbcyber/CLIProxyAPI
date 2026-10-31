@@ -889,7 +889,7 @@ func (s *authScheduler) upsertAuthRebuildLocked(auth *Auth, existingMetas map[st
 	providerState := s.ensureProviderLocked(providerKey)
 	regEpoch := registry.GetGlobalRegistry().ClientRegistrationEpoch(authID)
 	meta := buildScheduledAuthMetaWithModelSet(authToSchedule, supportedModelSetForAuth(authToSchedule.ID), regEpoch)
-	if previous := existingMetas[authID]; previous != nil {
+	if previous := existingMetas[authID]; previous != nil && previous.auth.RegistrationEpoch == meta.auth.RegistrationEpoch && quotaObservationIdentityMatches(previous.auth, meta.auth) {
 		meta.soonestReset = meta.soonestReset.carry(previous.soonestReset)
 	}
 	s.authProviders[authID] = providerKey
@@ -1149,7 +1149,7 @@ func (p *providerScheduler) upsertAuthForModelsLocked(meta *scheduledAuthMeta, t
 	if p == nil || meta == nil || meta.auth == nil {
 		return
 	}
-	if previous := p.auths[meta.auth.ID]; previous != nil && previous != meta {
+	if previous := p.auths[meta.auth.ID]; previous != nil && previous != meta && previous.auth.RegistrationEpoch == meta.auth.RegistrationEpoch && quotaObservationIdentityMatches(previous.auth, meta.auth) {
 		meta.soonestReset = meta.soonestReset.carry(previous.soonestReset)
 	}
 	p.auths[meta.auth.ID] = meta

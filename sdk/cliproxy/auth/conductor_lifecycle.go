@@ -354,6 +354,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	} else if auth.RegistrationEpoch == 0 {
 		auth.RegistrationEpoch = m.authEpochs[auth.ID]
 	}
+	accountReplaced := (ProviderSupportsQuotaObservation(existing.Provider) || ProviderSupportsQuotaObservation(auth.Provider)) && !quotaObservationIdentityMatches(existing, auth)
 	if !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
@@ -494,6 +495,13 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		return nil, false, false, fmt.Errorf("auth %s changed registration during persistence", auth.ID)
 	}
 	mergeAuthSaveDelta(auth, existingBeforeSave, existing, false)
+	if accountReplaced {
+		m.authEpochs[auth.ID]++
+		auth.RegistrationEpoch = m.authEpochs[auth.ID]
+		// Lifecycle merges can copy the predecessor's passive snapshot back in.
+		// Cooldowns remain governed by the existing update policy.
+		auth.Quota.ClearObservationSignals()
+	}
 	if (auth.RejectedAccessToken == "" && existing.RejectedAccessToken != "") || (auth.RejectedSIWCAccessToken == "" && existing.RejectedSIWCAccessToken != "") {
 		probe := auth.Clone()
 		probe.CodexRefreshPatch = refreshPatchBeforeSave
